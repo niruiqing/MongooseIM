@@ -511,6 +511,12 @@ normal_state({route, From, ToNick,
         JIDs -> lists:foreach(FunRouteNickIq, JIDs)
     end,
     {next_state, normal_state, StateData};
+normal_state({http_auth, {ok, _Msg}, From, Nick, Packet, Role}, StateData) ->
+    NewStateData = do_add_new_user(From, Nick, Packet, Role, StateData),
+    {next_state, normal_state, NewStateData};
+normal_state({http_auth, _Error, From, Nick, Packet, _Role}, StateData) ->
+    NewStateData = reply_invalid_password(From, Nick, Packet, StateData),
+    {next_state, normal_state, NewStateData};
 normal_state(_Event, StateData) ->
     {next_state, normal_state, StateData}.
 
@@ -1773,26 +1779,29 @@ is_next_session_of_occupant(From, Nick, StateData) ->
         end, Jids)
   end.
 
--spec choose_new_user_strategy(ejabberd:jid(), mod_muc:nick(),
-        mod_muc:affiliation(), mod_muc:role(), [jlib:xmlcdata() | jlib:xmlel()],
-        state()) -> new_user_strategy().
-choose_new_user_strategy(From, Nick, Affiliation, Role, Els, StateData) ->
+%% -spec choose_new_user_strategy(ejabberd:jid(), mod_muc:nick(),
+%%         mod_muc:affiliation(), mod_muc:role(), [jlib:xmlcdata() | jlib:xmlel()],
+%%         state()) -> new_user_strategy().
+choose_new_user_strategy(From, Nick, Affiliation, Role, Els, StateData, HttpAuthPool) ->
     case {is_user_limit_reached(From, Affiliation, StateData),
           is_nick_exists(Nick, StateData),
           is_next_session_of_occupant(From, Nick, StateData),
           mod_muc:can_use_nick(StateData#state.host, From, Nick),
           Role,
-          Affiliation} of
-        {false, _, _, _, _, _} ->
+          Affiliation,
+          HttpAuthPool} of
+        {false, _, _, _, _, _, _} ->
             limit_reached;
-        {_, _, _, _, none, outcast} ->
+        {_, _, _, _, none, outcast, _} ->
             user_banned;
-        {_, _, _, _, none, _} ->
+        {_, _, _, _, none, _, _} ->
             require_membership;
-        {_, true, false, _, _, _} ->
+        {_, true, false, _, _, _, _} ->
             conflict_use;
-        {_, _, _, false, _, _} ->
+        {_, _, _, false, _, _, _} ->
             conflict_registered;
+        {_, _, _, _, _, _, Pool} when Pool =/= undefined ->
+            http_auth;
         _ ->
             ServiceAffiliation = get_service_affiliation(From, StateData),
             case check_password(
@@ -1808,11 +1817,11 @@ choose_new_user_strategy(From, Nick, Affiliation, Role, Els, StateData) ->
                    ) -> state().
 add_new_user(From, Nick,
              #xmlel{attrs = Attrs, children = Els} = Packet,
-             #state{} = StateData) ->
+             #state{config = #config{http_auth_pool = HttpAuthPool}} = StateData) ->
     Lang = xml:get_attr_s(<<"xml:lang">>, Attrs),
     Affiliation = get_affiliation(From, StateData),
     Role = get_default_role(Affiliation, StateData),
-    case choose_new_user_strategy(From, Nick, Affiliation, Role, Els, StateData) of
+    case choose_new_user_strategy(From, Nick, Affiliation, Role, Els, HttpAuthPool, StateData) of
         limit_reached ->
             % max user reached and user is not admin or owner
             Err = jlib:make_error_reply(Packet, ?ERR_SERVICE_UNAVAILABLE_WAIT),
@@ -1844,29 +1853,71 @@ add_new_user(From, Nick,
             Err = jlib:make_error_reply(
                 Packet, ?ERRT_NOT_AUTHORIZED(Lang, ErrText)),
             route_error(Nick, From, Err, StateData);
+        http_auth ->
+            Password = xml:get_attr_s(<<"password">>, Attrs),
+            RoomPid = self(),
+            RoomJid = StateData#state.jid,
+            PathPrefix = mod_http_client:get_path_prefix(HttpAuthPool),
+            spawn(fun() -> make_http_auth_request(From, Nick, Packet, Role, RoomJid,
+                                                  RoomPid, Password, PathPrefix)
+                  end),
+            StateData;
         allowed ->
-            NewState =
-            add_user_presence(
-              From, Packet,
-              add_online_user(From, Nick, Role, StateData)),
-            send_existing_presences(From, NewState),
-            send_new_presence(From, NewState),
-            Shift = count_stanza_shift(Nick, Els, NewState),
-            case send_history(From, Shift, NewState) of
-                true ->
-                    ok;
-                _ ->
-                    send_subject(From, Lang, StateData)
-            end,
-            case NewState#state.just_created of
-                true ->
-                    NewState#state{just_created = false};
-                false ->
-                    Robots = ?DICT:erase(From, StateData#state.robots),
-                    NewState#state{robots = Robots}
-            end
+            do_add_new_user(From, Nick, Packet, Role, StateData)
     end.
 
+make_http_auth_request(From, Nick, Packet, Role, RoomJid, RoomPid, Password, PathPrefix) ->
+    Host = From#jid.server,
+    FromBin = jid:to_binary(From),
+    RoomJidBin = jid:to_binary(RoomJid),
+    Path = <<"$", PathPrefix/binary, "/check_password">>,
+    Query = <<"from=", FromBin/binary, "&to=", RoomJidBin/binary, "&pass=", Password/binary>>,
+    Result =
+        case mod_http_client:make_request(Host, muc_http_auth, Path, "GET", [], Query, 1000) of
+            {ok, {200, Res}} -> decode_http_auth_response(Res);
+            _ -> {error, <<"Internal server error">>}
+        end,
+    gen_fsm:send_event(RoomPid, {http_auth, Result, From, Nick, Packet, Role}).
+
+decode_http_auth_response(Response) ->
+    {struct, Properties} = mochijson2:decode(Response),
+    Code = proplists:get_value(<<"code">>, Properties),
+    Msg = proplists:get_value(<<"msg">>, Properties),
+    {case Code of
+         0 -> ok;
+         _ -> error
+     end, Msg}.
+
+reply_invalid_password(From, Nick, Packet, StateData) ->
+    ErrText = <<"Incorrect password">>,
+    Lang = xml:get_attr_s(<<"xml:lang">>, Packet#xmlel.attrs),
+    Err = jlib:make_error_reply(
+            Packet, ?ERRT_NOT_AUTHORIZED(Lang, ErrText)),
+    route_error(Nick, From, Err, StateData).
+
+do_add_new_user(From, Nick, #xmlel{attrs = Attrs, children = Els} = Packet,
+                Role, StateData) ->
+    Lang = xml:get_attr_s(<<"xml:lang">>, Attrs),
+    NewState =
+        add_user_presence(
+          From, Packet,
+          add_online_user(From, Nick, Role, StateData)),
+    send_existing_presences(From, NewState),
+    send_new_presence(From, NewState),
+    Shift = count_stanza_shift(Nick, Els, NewState),
+    case send_history(From, Shift, NewState) of
+        true ->
+            ok;
+        _ ->
+            send_subject(From, Lang, StateData)
+    end,
+    case NewState#state.just_created of
+        true ->
+            NewState#state{just_created = false};
+        false ->
+            Robots = ?DICT:erase(From, StateData#state.robots),
+            NewState#state{robots = Robots}
+    end.
 
 -spec check_password(ServiceAffiliation :: mod_muc:affiliation(),
         Affiliation :: mod_muc:affiliation(), Els :: [jlib:xmlel()], _From,
@@ -3756,6 +3807,8 @@ set_opts([{Opt, Val} | Opts], SD=#state{config = C = #config{}}) ->
             SD#state{subject = Val};
         subject_author ->
             SD#state{subject_author = Val};
+        http_auth_pool ->
+            SD#state{config = C#config{http_auth_pool = Val}};
         _ ->
             SD
        end,

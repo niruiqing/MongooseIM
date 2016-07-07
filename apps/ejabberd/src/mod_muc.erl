@@ -112,7 +112,8 @@
                 access,
                 history_size        :: integer(),
                 default_room_opts   :: list(),
-                room_shaper         :: shaper:shaper()
+                room_shaper         :: shaper:shaper(),
+                http_pool           :: atom()
               }).
 
 -type state() :: #state{}.
@@ -284,16 +285,18 @@ init([Host, Opts]) ->
     AccessCreate = gen_mod:get_opt(access_create, Opts, all),
     AccessAdmin = gen_mod:get_opt(access_admin, Opts, none),
     AccessPersistent = gen_mod:get_opt(access_persistent, Opts, all),
+    HttpPool = gen_mod:get_opt(http_pool, Opts, none),
     HistorySize = gen_mod:get_opt(history_size, Opts, 20),
     DefRoomOpts = gen_mod:get_opt(default_room_options, Opts, []),
-    RoomShaper = gen_mod:get_opt(room_shaper, Opts, none),
+    RoomShaper = gen_mod:get_opt(room_shaper, Opts, undefined),
 
     State = #state{host = MyHost,
-            server_host = Host,
-            access = {Access, AccessCreate, AccessAdmin, AccessPersistent},
-            default_room_opts = DefRoomOpts,
-            history_size = HistorySize,
-            room_shaper = RoomShaper},
+                   server_host = Host,
+                   access = {Access, AccessCreate, AccessAdmin, AccessPersistent},
+                   default_room_opts = set_http_auth_pool(Host, Opts, DefRoomOpts),
+                   history_size = HistorySize,
+                   room_shaper = RoomShaper,
+                   http_pool = HttpPool},
 
     ejabberd_hooks:add(is_muc_room_owner, MyHost, ?MODULE, is_room_owner, 50),
     ejabberd_hooks:add(muc_room_pid, MyHost, ?MODULE, muc_room_pid, 50),
@@ -309,6 +312,14 @@ init([Host, Opts]) ->
                          HistorySize,
                          RoomShaper),
     {ok, State}.
+
+set_http_auth_pool(Host, Opts, DefRoomOpts) ->
+    case gen_mod:get_opt(http_pool, Opts, none) of
+        none ->
+            DefRoomOpts;
+        PoolName ->
+            [{http_auth_pool, mod_http_client:lookup_pool(Host, PoolName)} | DefRoomOpts]
+    end.
 
 %%--------------------------------------------------------------------
 %% Function: %% handle_call(Request, From, State) -> {reply, Reply, State} |

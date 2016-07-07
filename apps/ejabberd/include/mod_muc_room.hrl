@@ -49,7 +49,8 @@
                  anonymous = true               :: boolean(),
                  max_users = ?MAX_USERS_DEFAULT :: pos_integer() | none,
                  maygetmemberlist = [],
-                 logging = false                :: boolean()
+                 logging = false                :: boolean(),
+                 http_auth_pool                 :: mod_http_client:http_pool()
                 }).
 
 -record(user, {
