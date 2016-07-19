@@ -89,7 +89,9 @@ make_response(Response) ->
 
 check_packet(Packet, ReqPattern) ->
     case erlang:decode_packet(http, Packet, []) of
-        {ok, {http_request, 'POST', _, _}, Body} ->
+        {ok, {http_request, Method, _, _}, Body}
+          when Method =:= 'GET';
+               Method =:= 'POST' ->
             check_body(Body, ReqPattern);
         _ ->
             invalid

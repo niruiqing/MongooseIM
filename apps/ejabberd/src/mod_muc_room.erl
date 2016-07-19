@@ -117,7 +117,8 @@
                            | 'limit_reached'
                            | 'require_membership'
                            | 'require_password'
-                           | 'user_banned'.
+                           | 'user_banned'
+                           | 'http_auth'.
 -type users_dict() :: dict:dict(ejabberd:simple_jid(), user()).
 -type sessions_dict() :: dict:dict(mod_muc:nick(), ejabberd:jid()).
 
@@ -925,7 +926,8 @@ rewrite_next_state(_, {stop, normal, StateData}) ->
 
 -spec destroy_temporary_room_if_empty(state()) -> fsm_return().
 destroy_temporary_room_if_empty(StateData=#state{config=C=#config{}}) ->
-    case (not C#config.persistent) andalso is_empty_room(StateData) of
+    case (not C#config.persistent) andalso is_empty_room(StateData)
+        andalso StateData#state.auth_pids == [] of
         true ->
             ?INFO_MSG("Destroyed MUC room ~s because it's temporary and empty",
                   [jid:to_binary(StateData#state.jid)]),
@@ -1782,36 +1784,37 @@ is_next_session_of_occupant(From, Nick, StateData) ->
 %% -spec choose_new_user_strategy(ejabberd:jid(), mod_muc:nick(),
 %%         mod_muc:affiliation(), mod_muc:role(), [jlib:xmlcdata() | jlib:xmlel()],
 %%         state()) -> new_user_strategy().
-choose_new_user_strategy(From, Nick, Affiliation, Role, Els, StateData, HttpAuthPool) ->
+choose_new_user_strategy(From, Nick, Affiliation, Role, Els, StateData) ->
     case {is_user_limit_reached(From, Affiliation, StateData),
           is_nick_exists(Nick, StateData),
           is_next_session_of_occupant(From, Nick, StateData),
           mod_muc:can_use_nick(StateData#state.host, From, Nick),
           Role,
-          Affiliation,
-          HttpAuthPool} of
-        {false, _, _, _, _, _, _} ->
+          Affiliation} of
+        {false, _, _, _, _, _} ->
             limit_reached;
-        {_, _, _, _, none, outcast, _} ->
+        {_, _, _, _, none, outcast} ->
             user_banned;
-        {_, _, _, _, none, _, _} ->
+        {_, _, _, _, none, _} ->
             require_membership;
-        {_, true, false, _, _, _, _} ->
+        {_, true, false, _, _, _} ->
             conflict_use;
-        {_, _, _, false, _, _, _} ->
+        {_, _, _, false, _, _} ->
             conflict_registered;
-        {_, _, _, _, _, _, Pool} when Pool =/= undefined ->
-            http_auth;
         _ ->
-            ServiceAffiliation = get_service_affiliation(From, StateData),
-            case check_password(
-                ServiceAffiliation, Affiliation, Els, From, StateData) of
-                true    -> allowed;
-                nopass  -> require_password;
-                _       -> invalid_password
-            end
+            choose_new_user_password_strategy(From, Els, StateData)
     end.
 
+choose_new_user_password_strategy(From, Els, StateData) ->
+    ServiceAffiliation = get_service_affiliation(From, StateData),
+    Config = StateData#state.config,
+    case is_password_required(ServiceAffiliation, Config) of
+        false -> allowed;
+        true -> case extract_password(Els) of
+                    false -> require_password;
+                    Password -> check_password(StateData#state.config, Password)
+                end
+    end.
 
 -spec add_new_user(ejabberd:jid(), mod_muc:nick(), jlib:xmlel(), state()
                    ) -> state().
@@ -1821,7 +1824,7 @@ add_new_user(From, Nick,
     Lang = xml:get_attr_s(<<"xml:lang">>, Attrs),
     Affiliation = get_affiliation(From, StateData),
     Role = get_default_role(Affiliation, StateData),
-    case choose_new_user_strategy(From, Nick, Affiliation, Role, Els, HttpAuthPool, StateData) of
+    case choose_new_user_strategy(From, Nick, Affiliation, Role, Els, StateData) of
         limit_reached ->
             % max user reached and user is not admin or owner
             Err = jlib:make_error_reply(Packet, ?ERR_SERVICE_UNAVAILABLE_WAIT),
@@ -1854,14 +1857,15 @@ add_new_user(From, Nick,
                 Packet, ?ERRT_NOT_AUTHORIZED(Lang, ErrText)),
             route_error(Nick, From, Err, StateData);
         http_auth ->
-            Password = xml:get_attr_s(<<"password">>, Attrs),
+            Password = extract_password(Els),
             RoomPid = self(),
             RoomJid = StateData#state.jid,
             PathPrefix = mod_http_client:get_path_prefix(HttpAuthPool),
-            spawn(fun() -> make_http_auth_request(From, Nick, Packet, Role, RoomJid,
-                                                  RoomPid, Password, PathPrefix)
-                  end),
-            StateData;
+            Pid = spawn(fun() -> make_http_auth_request(From, Nick, Packet, Role, RoomJid,
+                                                        RoomPid, Password, PathPrefix)
+                        end),
+            AuthPids = StateData#state.auth_pids,
+            StateData#state{auth_pids = [Pid | AuthPids]};
         allowed ->
             do_add_new_user(From, Nick, Packet, Role, StateData)
     end.
@@ -1874,7 +1878,7 @@ make_http_auth_request(From, Nick, Packet, Role, RoomJid, RoomPid, Password, Pat
     Query = <<"from=", FromBin/binary, "&to=", RoomJidBin/binary, "&pass=", Password/binary>>,
     Result =
         case mod_http_client:make_request(Host, muc_http_auth, Path, "GET", [], Query, 1000) of
-            {ok, {200, Res}} -> decode_http_auth_response(Res);
+            {ok, {<<"200">>, Res}} -> decode_http_auth_response(Res);
             _ -> {error, <<"Internal server error">>}
         end,
     gen_fsm:send_event(RoomPid, {http_auth, Result, From, Nick, Packet, Role}).
@@ -1919,27 +1923,18 @@ do_add_new_user(From, Nick, #xmlel{attrs = Attrs, children = Els} = Packet,
             NewState#state{robots = Robots}
     end.
 
--spec check_password(ServiceAffiliation :: mod_muc:affiliation(),
-        Affiliation :: mod_muc:affiliation(), Els :: [jlib:xmlel()], _From,
-        state()) -> boolean() | nopass.
-check_password(owner, _Affiliation, _Els, _From, _StateData) ->
+is_password_required(owner, _Config) ->
     %% Don't check pass if user is owner in MUC service (access_admin option)
-    true;
-check_password(_ServiceAffiliation, _Affiliation, Els, _From, StateData) ->
-    case (StateData#state.config)#config.password_protected of
-        false ->
-            %% Don't check password
-            true;
-        true ->
-            Pass = extract_password(Els),
-            case Pass of
-                false ->
-                    nopass;
-                _ ->
-                    (StateData#state.config)#config.password =:= Pass
-            end
-    end.
+    false;
+is_password_required(_, Config) ->
+    Config#config.password_protected.
 
+check_password(#config{http_auth_pool = undefined, password = Password}, Password) ->
+    allowed;
+check_password(#config{http_auth_pool = undefined}, _Password) ->
+    invalid_password;
+check_password(#config{http_auth_pool = _Pool}, _Password) ->
+    http_auth.
 
 -spec extract_password([jlib:xmlcdata() | jlib:xmlel()]) -> 'false' | binary().
 extract_password([]) ->

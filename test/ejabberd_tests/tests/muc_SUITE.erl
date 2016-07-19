@@ -57,15 +57,16 @@
 %%--------------------------------------------------------------------
 
 all() -> [
-        {group, disco},
-        {group, disco_rsm},
-        {group, moderator},
-        {group, admin},
-        {group, admin_membersonly},
-        {group, occupant},
-        {group, owner},
-        {group, owner_no_parallel},
-        {group, room_management}
+        %% {group, disco},
+        %% {group, disco_rsm},
+        %% {group, moderator},
+        %% {group, admin},
+        %% {group, admin_membersonly},
+        %% {group, occupant},
+        %% {group, owner},
+        %% {group, owner_no_parallel},
+        %% {group, room_management},
+        {group, http_auth}
         ].
 
 groups() -> [
@@ -194,7 +195,10 @@ groups() -> [
         {room_management, [], [
                 create_and_destroy_room,
                 create_and_destroy_room_multiple_x_elements
-                ]}
+                ]},
+        {http_auth, [], [
+                         enter_http_protected_room
+                        ]}
         ].
 
 rsm_cases() ->
@@ -246,8 +250,30 @@ init_per_group(disco_rsm, Config) ->
     [Alice | _] = ?config(escalus_users, Config1),
     start_rsm_rooms(Config1, Alice, <<"aliceonchat">>);
 
+init_per_group(http_auth, Config) ->
+    ConfigWithModules = dynamic_modules:save_modules(domain(), Config),
+    dynamic_modules:ensure_modules(domain(), required_modules(http_auth)),
+    ConfigWithModules;
+
 init_per_group(_GroupName, Config) ->
     escalus:create_users(Config, escalus:get_users([alice, bob, kate])).
+
+required_modules(http_auth) ->
+    [{mod_http_client, [{pools, [
+                                 {muc_http_auth, [{host, "http://localhost:8080"},
+                                                  {path_prefix, "/muc/auth/"},
+                                                  {pool_size, 4}]
+                                 }
+                                ]
+                        }]
+     },
+     {mod_muc, [
+                {host, "muc.@HOST@"},
+                {access, muc},
+                {access_create, muc_create},
+                {http_pool, muc_http_auth}
+               ]}
+    ].
 
 end_per_group(admin_membersonly, Config) ->
     destroy_room(Config),
@@ -261,8 +287,14 @@ end_per_group(disco_rsm, Config) ->
     destroy_rsm_rooms(Config),
     escalus:delete_users(Config, escalus:get_users([alice, bob]));
 
+end_per_group(http_auth, Config) ->
+    dynamic_modules:restore_modules(domain(), Config);
+
 end_per_group(_GroupName, Config) ->
     escalus:delete_users(Config, escalus:get_users([alice, bob, kate])).
+
+domain() ->
+    ct:get_config({hosts, mim, domain}).
 
 init_per_testcase(CaseName =send_non_anonymous_history, Config) ->
     [Alice | _] = ?config(escalus_users, Config),
@@ -1823,6 +1855,17 @@ deny_access_to_password_protected_room(Config1) ->
 enter_password_protected_room(Config1) ->
     AliceSpec = given_fresh_spec(Config1, alice),
     Config = given_fresh_room(Config1, AliceSpec, [{password_protected, true}, {password, ?PASSWORD}]),
+    escalus:fresh_story(Config, [{bob, 1}], fun(Bob) ->
+        escalus:send(Bob, stanza_muc_enter_password_protected_room(?config(room, Config), escalus_utils:get_username(Bob), ?PASSWORD)),
+        Presence = escalus:wait_for_stanza(Bob),
+		is_self_presence(Bob, ?config(room, Config), Presence)
+    end),
+    destroy_room(Config).
+
+enter_http_protected_room(Config1) ->
+    AliceSpec = given_fresh_spec(Config1, alice),
+    Config = given_fresh_room(Config1, AliceSpec, default),
+    http_helper:listen_once(self(), 8080, <<"b0b">>, <<"{\"code\":0,\"msg\":\"OK\"}">>),
     escalus:fresh_story(Config, [{bob, 1}], fun(Bob) ->
         escalus:send(Bob, stanza_muc_enter_password_protected_room(?config(room, Config), escalus_utils:get_username(Bob), ?PASSWORD)),
         Presence = escalus:wait_for_stanza(Bob),
@@ -3600,8 +3643,12 @@ pagination_after10(Config) ->
         escalus:send(Alice, stanza_room_list_request(<<"after10">>, RSM)),
         wait_room_range(Alice, 11, 15),
         ok
-        end,
+        end, 
     escalus:fresh_story(Config, [{alice, 1}], F).
+
+%%--------------------------------------------------------------------
+%% HTTP Authentication with an external component
+%%--------------------------------------------------------------------
 
 %% @doc Based on examples from http://xmpp.org/extensions/xep-0059.html
 %% @end

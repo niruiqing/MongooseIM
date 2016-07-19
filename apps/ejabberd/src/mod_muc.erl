@@ -318,7 +318,8 @@ set_http_auth_pool(Host, Opts, DefRoomOpts) ->
         none ->
             DefRoomOpts;
         PoolName ->
-            [{http_auth_pool, mod_http_client:lookup_pool(Host, PoolName)} | DefRoomOpts]
+            [{http_auth_pool, mod_http_client:get_pool(Host, PoolName)},
+             {password_protected, true} | DefRoomOpts]
     end.
 
 %%--------------------------------------------------------------------

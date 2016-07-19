@@ -87,7 +87,8 @@
                 just_created = false     :: boolean(),
                 activity = treap:empty() :: treap:treap(),
                 room_shaper              :: shaper:shaper(),
-                room_queue = queue:new()
+                room_queue = queue:new(),
+                auth_pids = []
                }).
 
 -record(muc_online_users, {
