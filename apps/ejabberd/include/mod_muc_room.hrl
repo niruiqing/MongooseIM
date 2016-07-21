@@ -49,8 +49,7 @@
                  anonymous = true               :: boolean(),
                  max_users = ?MAX_USERS_DEFAULT :: pos_integer() | none,
                  maygetmemberlist = [],
-                 logging = false                :: boolean(),
-                 http_auth_pool                 :: mod_http_client:http_pool()
+                 logging = false                :: boolean()
                 }).
 
 -record(user, {
@@ -88,7 +87,8 @@
                 activity = treap:empty() :: treap:treap(),
                 room_shaper              :: shaper:shaper(),
                 room_queue = queue:new(),
-                auth_pids = []
+                http_auth_pool = none :: none | mod_http_client:http_pool(),
+                http_auth_pids = [] :: [pid()]
                }).
 
 -record(muc_online_users, {

@@ -24,7 +24,7 @@
 
 -define(MUC_HOST, <<"muc.localhost">>).
 -define(MUC_CLIENT_HOST, <<"localhost/res1">>).
--define(PASSWORD, <<"password">>).
+-define(PASSWORD, <<"p@ssw0rd">>).
 -define(SUBJECT, <<"subject">>).
 -define(WAIT_TIME, 1500).
 
@@ -57,15 +57,15 @@
 %%--------------------------------------------------------------------
 
 all() -> [
-        %% {group, disco},
-        %% {group, disco_rsm},
-        %% {group, moderator},
-        %% {group, admin},
-        %% {group, admin_membersonly},
-        %% {group, occupant},
-        %% {group, owner},
-        %% {group, owner_no_parallel},
-        %% {group, room_management},
+        {group, disco},
+        {group, disco_rsm},
+        {group, moderator},
+        {group, admin},
+        {group, admin_membersonly},
+        {group, occupant},
+        {group, owner},
+        {group, owner_no_parallel},
+        {group, room_management},
         {group, http_auth}
         ].
 
@@ -197,7 +197,14 @@ groups() -> [
                 create_and_destroy_room_multiple_x_elements
                 ]},
         {http_auth, [], [
-                         enter_http_protected_room
+                         enter_http_password_protected_room,
+                         deny_access_to_password_protected_room,
+                         deny_access_to_http_password_protected_room_wrong_password,
+                         deny_access_to_http_password_protected_room_service_unavailable,
+                         create_instant_http_password_protected_room,
+                         deny_access_to_instant_http_password_protected_room,
+                         deny_access_to_instant_http_password_protected_room_wrong_password,
+                         deny_access_to_instant_http_password_protected_room_service_unavailable
                         ]}
         ].
 
@@ -261,8 +268,8 @@ init_per_group(_GroupName, Config) ->
 required_modules(http_auth) ->
     [{mod_http_client, [{pools, [
                                  {muc_http_auth, [{host, "http://localhost:8080"},
-                                                  {path_prefix, "/muc/auth/"},
-                                                  {pool_size, 4}]
+                                                  {path_prefix, "/muc/auth"},
+                                                  {pool_size, 5}]
                                  }
                                 ]
                         }]
@@ -271,7 +278,8 @@ required_modules(http_auth) ->
                 {host, "muc.@HOST@"},
                 {access, muc},
                 {access_create, muc_create},
-                {http_pool, muc_http_auth}
+                {http_auth_pool, muc_http_auth},
+                {default_room_options, [{password_protected, true}]}
                ]}
     ].
 
@@ -1850,6 +1858,25 @@ deny_access_to_password_protected_room(Config1) ->
     end),
     destroy_room(Config).
 
+deny_access_to_http_password_protected_room_wrong_password(Config1) ->
+    http_helper:listen_once(self(), 8080, <<"badpass">>, <<"121: Access token expired">>),
+    AliceSpec = given_fresh_spec(Config1, alice),
+    Config = given_fresh_room(Config1, AliceSpec, [{password_protected, true}]),
+    escalus:fresh_story(Config, [{bob, 1}], fun(Bob) ->
+        escalus:send(Bob, stanza_muc_enter_password_protected_room(?config(room, Config), escalus_utils:get_username(Bob), <<"badpass">>)),
+        escalus_assert:is_error(escalus:wait_for_stanza(Bob), <<"auth">>, <<"not-authorized">>)
+    end),
+    destroy_room(Config).
+
+deny_access_to_http_password_protected_room_service_unavailable(Config1) ->
+    AliceSpec = given_fresh_spec(Config1, alice),
+    Config = given_fresh_room(Config1, AliceSpec, [{password_protected, true}]),
+    escalus:fresh_story(Config, [{bob, 1}], fun(Bob) ->
+        escalus:send(Bob, stanza_muc_enter_password_protected_room(?config(room, Config), escalus_utils:get_username(Bob), ?PASSWORD)),
+        escalus_assert:is_error(escalus:wait_for_stanza(Bob), <<"cancel">>, <<"service-unavailable">>)
+    end),
+    destroy_room(Config).
+
 %Example 28
 % Fails - no 110 status code in the self-presence messages
 enter_password_protected_room(Config1) ->
@@ -1862,14 +1889,14 @@ enter_password_protected_room(Config1) ->
     end),
     destroy_room(Config).
 
-enter_http_protected_room(Config1) ->
+enter_http_password_protected_room(Config1) ->
+    http_helper:listen_once(self(), 8080, ?PASSWORD, <<"true">>),
     AliceSpec = given_fresh_spec(Config1, alice),
-    Config = given_fresh_room(Config1, AliceSpec, default),
-    http_helper:listen_once(self(), 8080, <<"b0b">>, <<"{\"code\":0,\"msg\":\"OK\"}">>),
+    Config = given_fresh_room(Config1, AliceSpec, [{password_protected, true}]),
     escalus:fresh_story(Config, [{bob, 1}], fun(Bob) ->
         escalus:send(Bob, stanza_muc_enter_password_protected_room(?config(room, Config), escalus_utils:get_username(Bob), ?PASSWORD)),
         Presence = escalus:wait_for_stanza(Bob),
-		is_self_presence(Bob, ?config(room, Config), Presence)
+        is_self_presence(Bob, ?config(room, Config), Presence)
     end),
     destroy_room(Config).
 
@@ -2779,6 +2806,74 @@ create_instant_room(Config) ->
         escalus:assert_many(Preds, escalus:wait_for_stanzas(Bob, 2)),
         escalus:wait_for_stanza(Bob), %topic
         escalus_assert:has_no_stanzas(Bob),
+        escalus_assert:has_no_stanzas(Alice)
+    end).
+
+create_instant_http_password_protected_room(Config) ->
+    escalus:fresh_story(Config, [{alice, 1}, {bob, 1}], fun(Alice, Bob) ->
+
+        %% Create the room (should be locked on creation)
+        http_helper:listen_once(self(), 8080, ?PASSWORD, <<"true">>),
+        RoomName = fresh_room_name(),
+        Presence = stanza_muc_enter_password_protected_room(RoomName, <<"alice-the-owner">>, ?PASSWORD),
+        escalus:send(Alice, Presence),
+        was_room_created(escalus:wait_for_stanza(Alice)),
+
+        escalus:wait_for_stanza(Alice), % topic
+
+        R = escalus_stanza:setattr(stanza_instant_room(<<RoomName/binary,"@muc.localhost">>),
+                                   <<"from">>, escalus_utils:get_jid(Alice)),
+        escalus:send(Alice, R),
+        IQ = escalus:wait_for_stanza(Alice),
+        escalus:assert(is_iq_result, IQ),
+
+        %% Bob should be able to join the room
+        http_helper:listen_once(self(), 8080, ?PASSWORD, <<"true">>),
+        escalus:send(Bob, stanza_muc_enter_password_protected_room(RoomName, <<"bob">>, ?PASSWORD)),
+        escalus:wait_for_stanza(Alice), %Bobs presence
+        %% Bob should receive (in that order): Alices presence, his presence and the topic
+
+        Preds = [fun(Stanza) -> escalus_pred:is_presence(Stanza) andalso
+            escalus_pred:is_stanza_from(<<RoomName/binary, "@muc.localhost/bob">>, Stanza)
+        end,
+        fun(Stanza) -> escalus_pred:is_presence(Stanza) andalso
+            escalus_pred:is_stanza_from(<<RoomName/binary, "@muc.localhost/alice-the-owner">>, Stanza)
+        end],
+        escalus:assert_many(Preds, escalus:wait_for_stanzas(Bob, 2)),
+        escalus:wait_for_stanza(Bob), %topic
+        escalus_assert:has_no_stanzas(Bob),
+        escalus_assert:has_no_stanzas(Alice)
+    end).
+
+deny_access_to_instant_http_password_protected_room(Config) ->
+    escalus:fresh_story(Config, [{alice, 1}], fun(Alice) ->
+        %% Fail to create the room
+        RoomName = fresh_room_name(),
+        Presence = stanza_muc_enter_room(RoomName, <<"alice-the-owner">>),
+        escalus:send(Alice, Presence),
+        escalus_assert:is_error(escalus:wait_for_stanza(Alice), <<"auth">>, <<"not-authorized">>),
+        escalus_assert:has_no_stanzas(Alice)
+    end).
+
+deny_access_to_instant_http_password_protected_room_wrong_password(Config) ->
+    escalus:fresh_story(Config, [{alice, 1}], fun(Alice) ->
+        %% Fail to create the room
+        http_helper:listen_once(self(), 8080, <<"badpass">>, <<"123 Bad password">>),
+        RoomName = fresh_room_name(),
+        Presence = stanza_muc_enter_password_protected_room(RoomName, <<"alice-the-owner">>, <<"badpass">>),
+        escalus:send(Alice, Presence),
+        escalus_assert:is_error(escalus:wait_for_stanza(Alice), <<"auth">>, <<"not-authorized">>),
+        escalus_assert:has_no_stanzas(Alice)
+    end).
+
+
+deny_access_to_instant_http_password_protected_room_service_unavailable(Config) ->
+    escalus:fresh_story(Config, [{alice, 1}], fun(Alice) ->
+        %% Fail to create the room
+        RoomName = fresh_room_name(),
+        Presence = stanza_muc_enter_password_protected_room(RoomName, <<"alice-the-owner">>, ?PASSWORD),
+        escalus:send(Alice, Presence),
+        escalus_assert:is_error(escalus:wait_for_stanza(Alice), <<"cancel">>, <<"service-unavailable">>),
         escalus_assert:has_no_stanzas(Alice)
     end).
 

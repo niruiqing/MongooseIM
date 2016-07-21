@@ -30,10 +30,10 @@
 
 
 %% External exports
--export([start_link/9,
-         start_link/7,
-         start/9,
-         start/7,
+-export([start_link/10,
+         start_link/8,
+         start/10,
+         start/8,
          route/4]).
 
 %% API exports
@@ -138,51 +138,53 @@
 -define(SUPERVISOR_START,
         gen_fsm:start(?MODULE,
                       [Host, ServerHost, Access, Room, HistorySize,
-                       RoomShaper, Creator, Nick, DefRoomOpts],
+                       RoomShaper, HttpAuthPool, Creator, Nick, DefRoomOpts],
                       ?FSMOPTS)).
 -else.
 -define(SUPERVISOR_START,
         Supervisor = gen_mod:get_module_proc(ServerHost, ejabberd_mod_muc_sup),
         supervisor:start_child(Supervisor,
                                [Host, ServerHost, Access, Room, HistorySize,
-                                RoomShaper, Creator, Nick, DefRoomOpts])).
+                                RoomShaper, HttpAuthPool, Creator, Nick, DefRoomOpts])).
 -endif.
 
 %%%----------------------------------------------------------------------
 %%% API
 %%%----------------------------------------------------------------------
 -spec start(Host :: ejabberd:server(), ServerHost :: ejabberd:server(),
-        Access :: _, Room :: mod_muc:room(), HistorySize :: integer(),
-        RoomShaper :: shaper:shaper(), Creator :: ejabberd:jid(),
-        Nick :: mod_muc:nick(), DefRoomOpts :: list()) -> {'error',_}
-                                                | {'ok','undefined' | pid()}
-                                                | {'ok','undefined' | pid(),_}.
-start(Host, ServerHost, Access, Room, HistorySize, RoomShaper,
+            Access :: _, Room :: mod_muc:room(), HistorySize :: integer(),
+            RoomShaper :: shaper:shaper(), HttpAuthPool :: none | mod_http_client:pool(),
+            Creator :: ejabberd:jid(), Nick :: mod_muc:nick(),
+            DefRoomOpts :: list()) -> {'error',_}
+                                          | {'ok','undefined' | pid()}
+                                          | {'ok','undefined' | pid(),_}.
+start(Host, ServerHost, Access, Room, HistorySize, RoomShaper, HttpAuthPool,
       Creator, Nick, DefRoomOpts) ->
     ?SUPERVISOR_START.
 
 
 -spec start(Host :: ejabberd:server(), ServerHost :: ejabberd:server(),
-        Access :: _, Room :: mod_muc:room(), HistorySize :: integer(),
-        RoomShaper :: shaper:shaper(), Opts :: list()) -> {'error',_}
-                                                | {'ok','undefined' | pid()}
-                                                | {'ok','undefined' | pid(),_}.
-start(Host, ServerHost, Access, Room, HistorySize, RoomShaper, Opts) ->
+            Access :: _, Room :: mod_muc:room(), HistorySize :: integer(),
+            RoomShaper :: shaper:shaper(), HttpAuthPool :: none | mod_http_client:pool(),
+            Opts :: list()) -> {'error',_}
+                                   | {'ok','undefined' | pid()}
+                                   | {'ok','undefined' | pid(),_}.
+start(Host, ServerHost, Access, Room, HistorySize, RoomShaper, HttpAuthPool, Opts) ->
     Supervisor = gen_mod:get_module_proc(ServerHost, ejabberd_mod_muc_sup),
     supervisor:start_child(Supervisor, [Host, ServerHost, Access, Room,
-                                        HistorySize, RoomShaper, Opts]).
+                                        HistorySize, RoomShaper, HttpAuthPool, Opts]).
 
-start_link(Host, ServerHost, Access, Room, HistorySize, RoomShaper,
+start_link(Host, ServerHost, Access, Room, HistorySize, RoomShaper, HttpAuthPool,
        Creator, Nick, DefRoomOpts) ->
     gen_fsm:start_link(?MODULE,
                        [Host, ServerHost, Access, Room, HistorySize,
-                        RoomShaper, Creator, Nick, DefRoomOpts],
+                        RoomShaper, HttpAuthPool, Creator, Nick, DefRoomOpts],
                        ?FSMOPTS).
 
-start_link(Host, ServerHost, Access, Room, HistorySize, RoomShaper, Opts) ->
+start_link(Host, ServerHost, Access, Room, HistorySize, RoomShaper, HttpAuthPool, Opts) ->
     gen_fsm:start_link(?MODULE,
                        [Host, ServerHost, Access, Room, HistorySize,
-                        RoomShaper, Opts],
+                        RoomShaper, HttpAuthPool, Opts],
                        ?FSMOPTS).
 
 
@@ -244,8 +246,8 @@ can_access_identity(RoomJID, UserJID) ->
 %% next state is determined accordingly (a locked room for MUC or an instant
 %% one for groupchat).
 -spec init([any(),...]) -> {'ok',statename(), state()}.
-init([Host, ServerHost, Access, Room, HistorySize, RoomShaper, Creator, _Nick,
-      DefRoomOpts]) ->
+init([Host, ServerHost, Access, Room, HistorySize, RoomShaper, HttpAuthPool,
+      Creator, _Nick, DefRoomOpts]) ->
     process_flag(trap_exit, true),
     Shaper = shaper:new(RoomShaper),
     State = set_affiliation(Creator, owner,
@@ -256,7 +258,8 @@ init([Host, ServerHost, Access, Room, HistorySize, RoomShaper, Creator, _Nick,
                                    history = lqueue_new(HistorySize),
                                    jid = jid:make(Room, Host, <<>>),
                                    just_created = true,
-                                   room_shaper = Shaper}),
+                                   room_shaper = Shaper,
+                                   http_auth_pool = HttpAuthPool}),
     State1 = set_opts(DefRoomOpts, State),
     ?INFO_MSG("Created MUC room ~s@~s by ~s",
               [Room, Host, jid:to_binary(Creator)]),
@@ -274,7 +277,7 @@ init([Host, ServerHost, Access, Room, HistorySize, RoomShaper, Creator, _Nick,
 
 
 %% @doc A room is restored
-init([Host, ServerHost, Access, Room, HistorySize, RoomShaper, Opts]) ->
+init([Host, ServerHost, Access, Room, HistorySize, RoomShaper, HttpAuthPool, Opts]) ->
     process_flag(trap_exit, true),
     Shaper = shaper:new(RoomShaper),
     State = set_opts(Opts, #state{host = Host,
@@ -283,7 +286,8 @@ init([Host, ServerHost, Access, Room, HistorySize, RoomShaper, Opts]) ->
                                   room = Room,
                                   history = lqueue_new(HistorySize),
                                   jid = jid:make(Room, Host, <<>>),
-                                  room_shaper = Shaper}),
+                                  room_shaper = Shaper,
+                                  http_auth_pool = HttpAuthPool}),
     add_to_log(room_existence, started, State),
     {ok, normal_state, State}.
 
@@ -409,6 +413,9 @@ locked_state({route, From, ToNick,
         _ ->
             locked_error(Call, locked_state, StateData)
     end;
+locked_state({http_auth, AuthPid, Result, From, Nick, Packet, Role}, StateData) ->
+    NewStateData = handle_http_auth_result(AuthPid, Result, From, Nick, Packet, Role, StateData),
+    destroy_temporary_room_if_empty(NewStateData, locked_state);
 locked_state(Call, StateData) ->
     locked_error(Call, locked_state, StateData).
 
@@ -512,15 +519,20 @@ normal_state({route, From, ToNick,
         JIDs -> lists:foreach(FunRouteNickIq, JIDs)
     end,
     {next_state, normal_state, StateData};
-normal_state({http_auth, {ok, _Msg}, From, Nick, Packet, Role}, StateData) ->
-    NewStateData = do_add_new_user(From, Nick, Packet, Role, StateData),
-    {next_state, normal_state, NewStateData};
-normal_state({http_auth, _Error, From, Nick, Packet, _Role}, StateData) ->
-    NewStateData = reply_invalid_password(From, Nick, Packet, StateData),
-    {next_state, normal_state, NewStateData};
+normal_state({http_auth, AuthPid, Result, From, Nick, Packet, Role}, StateData) ->
+    NewStateData = handle_http_auth_result(AuthPid, Result, From, Nick, Packet, Role, StateData),
+    destroy_temporary_room_if_empty(NewStateData, normal_state);
 normal_state(_Event, StateData) ->
     {next_state, normal_state, StateData}.
 
+handle_http_auth_result(AuthPid, Result, From, Nick, Packet, Role, StateData) ->
+    AuthPids = StateData#state.http_auth_pids,
+    StateWithoutPid = StateData#state{http_auth_pids = lists:delete(AuthPid, AuthPids)},
+    case Result of
+        allowed -> do_add_new_user(From, Nick, Packet, Role, StateWithoutPid);
+        {invalid_password, ErrorMsg} -> reply_not_authorized(From, Nick, Packet, StateData, ErrorMsg);
+        {error, ErrorMsg} -> reply_service_unavailable(From, Nick, Packet, StateData, ErrorMsg)
+    end.
 
 %%----------------------------------------------------------------------
 %% Func: handle_event/3
@@ -669,6 +681,10 @@ handle_info(process_room_queue, normal_state = StateName, StateData) ->
     {empty, _} ->
         {next_state, StateName, StateData}
     end;
+handle_info({'EXIT', FromPid, _Reason}, StateName, StateData) ->
+    AuthPids = StateData#state.http_auth_pids,
+    StateWithoutPid = StateData#state{http_auth_pids = lists:delete(FromPid, AuthPids)},
+    destroy_temporary_room_if_empty(StateWithoutPid, StateName);
 handle_info(_Info, StateName, StateData) ->
     {next_state, StateName, StateData}.
 
@@ -907,7 +923,7 @@ get_participant_data(From, StateData) ->
                        Packet :: jlib:xmlel(), state()) -> fsm_return().
 process_presence(From, ToNick, Presence, StateData) ->
     StateData1 = process_presence1(From, ToNick, Presence, StateData),
-    destroy_temporary_room_if_empty(StateData1).
+    destroy_temporary_room_if_empty(StateData1, normal_state).
 
 
 -spec process_presence(From :: ejabberd:jid(), Nick :: mod_muc:nick(),
@@ -924,17 +940,17 @@ rewrite_next_state(_, {stop, normal, StateData}) ->
     {stop, normal, StateData}.
 
 
--spec destroy_temporary_room_if_empty(state()) -> fsm_return().
-destroy_temporary_room_if_empty(StateData=#state{config=C=#config{}}) ->
+-spec destroy_temporary_room_if_empty(state(), atom()) -> fsm_return().
+destroy_temporary_room_if_empty(StateData=#state{config=C=#config{}}, NextState) ->
     case (not C#config.persistent) andalso is_empty_room(StateData)
-        andalso StateData#state.auth_pids == [] of
+        andalso StateData#state.http_auth_pids == [] of
         true ->
             ?INFO_MSG("Destroyed MUC room ~s because it's temporary and empty",
                   [jid:to_binary(StateData#state.jid)]),
             add_to_log(room_existence, destroyed, StateData),
             {stop, normal, StateData};
         _ ->
-            {next_state, normal_state, StateData}
+            {next_state, NextState, StateData}
     end.
 
 
@@ -1812,7 +1828,7 @@ choose_new_user_password_strategy(From, Els, StateData) ->
         false -> allowed;
         true -> case extract_password(Els) of
                     false -> require_password;
-                    Password -> check_password(StateData#state.config, Password)
+                    Password -> check_password(StateData, Password)
                 end
     end.
 
@@ -1820,7 +1836,7 @@ choose_new_user_password_strategy(From, Els, StateData) ->
                    ) -> state().
 add_new_user(From, Nick,
              #xmlel{attrs = Attrs, children = Els} = Packet,
-             #state{config = #config{http_auth_pool = HttpAuthPool}} = StateData) ->
+             #state{http_auth_pool = HttpAuthPool} = StateData) ->
     Lang = xml:get_attr_s(<<"xml:lang">>, Attrs),
     Affiliation = get_affiliation(From, StateData),
     Role = get_default_role(Affiliation, StateData),
@@ -1861,11 +1877,11 @@ add_new_user(From, Nick,
             RoomPid = self(),
             RoomJid = StateData#state.jid,
             PathPrefix = mod_http_client:get_path_prefix(HttpAuthPool),
-            Pid = spawn(fun() -> make_http_auth_request(From, Nick, Packet, Role, RoomJid,
-                                                        RoomPid, Password, PathPrefix)
-                        end),
-            AuthPids = StateData#state.auth_pids,
-            StateData#state{auth_pids = [Pid | AuthPids]};
+            Pid = spawn_link(fun() -> make_http_auth_request(From, Nick, Packet, Role, RoomJid,
+                                                             RoomPid, Password, PathPrefix)
+                             end),
+            AuthPids = StateData#state.http_auth_pids,
+            StateData#state{http_auth_pids = [Pid | AuthPids]};
         allowed ->
             do_add_new_user(From, Nick, Packet, Role, StateData)
     end.
@@ -1874,29 +1890,24 @@ make_http_auth_request(From, Nick, Packet, Role, RoomJid, RoomPid, Password, Pat
     Host = From#jid.server,
     FromBin = jid:to_binary(From),
     RoomJidBin = jid:to_binary(RoomJid),
-    Path = <<"$", PathPrefix/binary, "/check_password">>,
+    Path = <<PathPrefix/binary, "/check_password">>,
     Query = <<"from=", FromBin/binary, "&to=", RoomJidBin/binary, "&pass=", Password/binary>>,
     Result =
         case mod_http_client:make_request(Host, muc_http_auth, Path, "GET", [], Query, 1000) of
-            {ok, {<<"200">>, Res}} -> decode_http_auth_response(Res);
+            {ok, {<<"200">>, <<"true">>}} -> allowed;
+            {ok, {<<"200">>, Body}} -> {invalid_password, Body};
             _ -> {error, <<"Internal server error">>}
         end,
-    gen_fsm:send_event(RoomPid, {http_auth, Result, From, Nick, Packet, Role}).
+    gen_fsm:send_event(RoomPid, {http_auth, self(), Result, From, Nick, Packet, Role}).
 
-decode_http_auth_response(Response) ->
-    {struct, Properties} = mochijson2:decode(Response),
-    Code = proplists:get_value(<<"code">>, Properties),
-    Msg = proplists:get_value(<<"msg">>, Properties),
-    {case Code of
-         0 -> ok;
-         _ -> error
-     end, Msg}.
-
-reply_invalid_password(From, Nick, Packet, StateData) ->
-    ErrText = <<"Incorrect password">>,
+reply_not_authorized(From, Nick, Packet, StateData, ErrText) ->
     Lang = xml:get_attr_s(<<"xml:lang">>, Packet#xmlel.attrs),
-    Err = jlib:make_error_reply(
-            Packet, ?ERRT_NOT_AUTHORIZED(Lang, ErrText)),
+    Err = jlib:make_error_reply(Packet, ?ERRT_NOT_AUTHORIZED(Lang, ErrText)),
+    route_error(Nick, From, Err, StateData).
+
+reply_service_unavailable(From, Nick, Packet, StateData, ErrText) ->
+    Lang = xml:get_attr_s(<<"xml:lang">>, Packet#xmlel.attrs),
+    Err = jlib:make_error_reply(Packet, ?ERRT_SERVICE_UNAVAILABLE(Lang, ErrText)),
     route_error(Nick, From, Err, StateData).
 
 do_add_new_user(From, Nick, #xmlel{attrs = Attrs, children = Els} = Packet,
@@ -1929,11 +1940,12 @@ is_password_required(owner, _Config) ->
 is_password_required(_, Config) ->
     Config#config.password_protected.
 
-check_password(#config{http_auth_pool = undefined, password = Password}, Password) ->
+check_password(#state{http_auth_pool = none,
+                      config = #config{password = Password}}, Password) ->
     allowed;
-check_password(#config{http_auth_pool = undefined}, _Password) ->
+check_password(#state{http_auth_pool = none}, _Password) ->
     invalid_password;
-check_password(#config{http_auth_pool = _Pool}, _Password) ->
+check_password(#state{http_auth_pool = _Pool}, _Password) ->
     http_auth.
 
 -spec extract_password([jlib:xmlcdata() | jlib:xmlel()]) -> 'false' | binary().
@@ -3802,8 +3814,6 @@ set_opts([{Opt, Val} | Opts], SD=#state{config = C = #config{}}) ->
             SD#state{subject = Val};
         subject_author ->
             SD#state{subject_author = Val};
-        http_auth_pool ->
-            SD#state{config = C#config{http_auth_pool = Val}};
         _ ->
             SD
        end,
